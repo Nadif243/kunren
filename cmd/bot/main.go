@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-	"kunnrenengine/internal/scraper"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"kunnrenengine/internal/worker"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -17,7 +20,7 @@ func main() {
 	// 1. Load the secret token from the .env file
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Println("Warning: No .env file found or error reading it.")
+		log.Println("Warning: No .env file found.")
 	}
 
 	token := os.Getenv("DISCORD_TOKEN")
@@ -62,6 +65,25 @@ func main() {
 	dg.Close()
 }
 
+// Helper function to read URLs from our text file
+func loadTargets(filename string) []string {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var urls []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && strings.HasPrefix(line, "http") {
+			urls = append(urls, line)
+		}
+	}
+	return urls
+}
+
 // This function is the callback for the event listener.
 // discordgo automatically spawns a NEW Goroutine for this function every single time a message is received.
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -74,31 +96,81 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// !scrape [URL] command test
-	if strings.HasPrefix(m.Content, "!scrape ") {
+	// !mine [keyword] command
+	if strings.HasPrefix(m.Content, "!mine ") {
 		// Extract the URL from the message
-		url := strings.TrimSpace(strings.TrimPrefix(m.Content, "!scrape "))
+		keyword := strings.TrimSpace(strings.TrimPrefix(m.Content, "!mine "))
 
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("⚙️ Fetching and parsing HTML from: <%s>...", url))
-
-		// Call our new internal package
-		sentences, err := scraper.ExtractSentences(url)
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("❌ **Scrape Failed:**\n`%v`", err))
+		// 1. Load the target list
+		urls := loadTargets("target.txt")
+		if len(urls) == 0 {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ `target.txt` is empty or missing.")
 			return
 		}
 
-		if len(sentences) == 0 {
-			s.ChannelMessageSend(m.ChannelID, "⚠️ No valid Japanese sentences found in <p> tags on this page.")
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🔍 **Mining %d sources** for the word: `%s`...", len(urls), keyword))
+
+		// 2. Ignite the Worker Pool (using 5 concurrent workers)
+		results := worker.RunPool(urls, 5)
+
+		// 3. The Goldilocks Filter
+		var validSentences []string
+		for _, res := range results {
+			if res.Err != nil {
+				continue // Silently ignore dead websites
+			}
+			for _, sentence := range res.Sentences {
+				// Must contain the exact keyword
+				if strings.Contains(sentence, keyword) {
+					runeCount := len([]rune(sentence))
+					// Must be longer than 15 chars (destroys headers/dates)
+					// Must be shorter than 60 chars (destroys run-on paragraphs)
+					if runeCount >= 15 && runeCount <= 60 {
+						validSentences = append(validSentences, sentence)
+					}
+				}
+			}
+		}
+
+		// 4. Handle No Results
+		if len(validSentences) == 0 {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("⚠️ No high-quality sentences found for `%s` matching the length criteria.", keyword))
 			return
 		}
 
-		// Preview the first 3 sentences found
-		preview := fmt.Sprintf("✅ **Scrape Successful!** Found %d sentences.\n\n**Preview:**\n", len(sentences))
-		for i := 0; i < 3 && i < len(sentences); i++ {
-			preview += fmt.Sprintf("%d. %s\n", i+1, sentences[i])
+		// 5. Shuffle the array to ensure fresh examples every search attempt
+		rand.Shuffle(len(validSentences), func(i, j int) {
+			validSentences[i], validSentences[j] = validSentences[j], validSentences[i]
+		})
+
+		// Limit output to the top 3
+		limit := 3
+		if len(validSentences) < limit {
+			limit = len(validSentences)
 		}
 
-		s.ChannelMessageSend(m.ChannelID, preview)
+		// 6. Format and Ship the Output as a Rich Embed
+		embed := &discordgo.MessageEmbed{
+			Title:       fmt.Sprintf("錬文 Engine: %s", keyword),
+			Description: fmt.Sprintf("Scanned **%d** sources.\nFound **%d** high-quality sentences.", len(urls), len(validSentences)),
+			// Set the color to a sleek gold/amber (Hex: #F5A623)
+			Color:  0xF5A623,
+			Fields: []*discordgo.MessageEmbedField{},
+		}
+
+		for i := 0; i < limit; i++ {
+			// Replace the target word with an inline code block so it has a distinct background
+			highlighted := strings.ReplaceAll(validSentences[i], keyword, fmt.Sprintf("`%s`", keyword))
+
+			// Append each sentence as its own distinct block in the UI
+			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+				Name:   fmt.Sprintf("Result %d", i+1),
+				Value:  highlighted,
+				Inline: false,
+			})
+		}
+
+		// Using SendEmbed instead of Send
+		s.ChannelMessageSendEmbed(m.ChannelID, embed)
 	}
 }
