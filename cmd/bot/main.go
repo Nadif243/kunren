@@ -210,29 +210,89 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	// --- STATE INTERCEPTOR ---
 	// If the user is in the middle of a process, intercept their message before checking commands.
 	if state, ok := userState.Load(m.Author.ID); ok {
-		if state == "awaiting_vault_create_name" {
-			vaultName := strings.TrimSpace(m.Content)
+		input := strings.TrimSpace(m.Content)
 
-			// Optional: Allow them to cancel
-			if vaultName == "cancel" {
-				userState.Delete(m.Author.ID)
-				s.ChannelMessageSend(m.ChannelID, "Vault creation aborted.")
-				return
-			}
+		// Global cancel catch
+		if input == "cancel" {
+			userState.Delete(m.Author.ID)
+			s.ChannelMessageSend(m.ChannelID, "Action aborted.")
+			return
+		}
 
-			// Execute creation
-			response, err := db.CreateVault(m.Author.ID, vaultName)
+		stateStr := state.(string)
+
+		// State: Creating a Vault
+		if stateStr == "awaiting_vault_create_name" {
+			response, err := db.CreateVault(m.Author.ID, input)
 			if err != nil {
 				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to structure the vault: "+err.Error())
 			} else {
 				s.ChannelMessageSend(m.ChannelID, "📖 "+response)
 			}
-
-			// Clear the state so they can use normal commands again
 			userState.Delete(m.Author.ID)
 			return
 		}
-		// You can add more states here later (e.g., awaiting_vault_delete_name)
+
+		// State: Opening a Vault
+		if stateStr == "awaiting_vault_open_name" {
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, input)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			sentences, err := db.OpenVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to open vault: "+err.Error())
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			embed := &discordgo.MessageEmbed{
+				Title: "📖 Vault Contents: 『 " + vaultName + " 』",
+				Color: 0xC6D8F0,
+			}
+			if len(sentences) == 0 {
+				embed.Description = "*This vault is currently empty.*"
+			} else {
+				var formatted []string
+				for i, sent := range sentences {
+					formatted = append(formatted, fmt.Sprintf("**%d.** %s", i+1, sent))
+				}
+				embed.Description = strings.Join(formatted, "\n\n")
+			}
+
+			s.ChannelMessageSendEmbed(m.ChannelID, embed)
+			userState.Delete(m.Author.ID)
+			return
+		}
+
+		// State: Deleting a Vault
+		if stateStr == "awaiting_vault_delete_name" {
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, input)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			if vaultName == "Primary Grimoire" {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ The Primary Grimoire cannot be destroyed.")
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			response, err := db.DeleteVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to incinerate vault: "+err.Error())
+			} else {
+				s.ChannelMessageSend(m.ChannelID, response)
+			}
+
+			userState.Delete(m.Author.ID)
+			return
+		}
 	}
 
 	// --- THE VAULT ROUTER ---
@@ -250,12 +310,15 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		// If they just typed exactly "!vault"
 		if len(args) == 1 {
-			helpText := "**📖 The Vault Grimoire**\n" +
-				"`!vault create <name>` - Forge a new collection\n" +
-				"`!vault list` - View your active vaults\n" +
-				"`!vault open <name>` - Inspect a vault's contents\n" +
-				"`!vault delete <name>` - Incinerate a collection"
-			s.ChannelMessageSend(m.ChannelID, helpText)
+			embed := &discordgo.MessageEmbed{
+				Title: "📖 The Vault Grimoire",
+				Color: 0xC6D8F0, // Powder Blue
+				Description: "`!vault create <name>` - Forge a new collection\n" +
+					"`!vault list` - View your active vaults\n" +
+					"`!vault open <name or index>` - Inspect a vault's contents\n" +
+					"`!vault delete <name or index>` - Incinerate a collection",
+			}
+			s.ChannelMessageSendEmbed(m.ChannelID, embed)
 			return
 		}
 
@@ -281,25 +344,109 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			s.ChannelMessageSend(m.ChannelID, "📖 "+response)
 
 		case "list":
-			// We will build db.ListVaults() next
-			s.ChannelMessageSend(m.ChannelID, "🔍 Listing vaults... (Feature pending)")
-
-		case "open":
-			// Same logic: Check if name was provided, if not, set a state or show error
-			if len(args) == 2 {
-				s.ChannelMessageSend(m.ChannelID, "⚠️ Please specify which vault to open: `!vault open <name>`")
+			listData, err := db.ListVaults(m.Author.ID)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Error reading the void: "+err.Error())
 				return
 			}
-			vaultName := strings.Join(args[2:], " ")
-			s.ChannelMessageSend(m.ChannelID, "📖 Opening vault: "+vaultName+"... (Feature pending)")
+			embed := &discordgo.MessageEmbed{
+				Title:       "🔍 Your Bound Grimoires",
+				Color:       0xC6D8F0,
+				Description: listData,
+			}
+			s.ChannelMessageSendEmbed(m.ChannelID, embed)
+
+		case "open":
+			if len(args) == 2 {
+				// Fetch their list of vaults
+				listData, err := db.ListVaults(m.Author.ID)
+				if err != nil {
+					s.ChannelMessageSend(m.ChannelID, "⚠️ Error reading the void: "+err.Error())
+					return
+				}
+
+				userState.Store(m.Author.ID, "awaiting_vault_open_name")
+
+				embed := &discordgo.MessageEmbed{
+					Title:       "📖 Select a Grimoire to Open",
+					Color:       0xC6D8F0,
+					Description: listData + "\n\n*Reply with the name or index number (or type `cancel`).*",
+				}
+				s.ChannelMessageSendEmbed(m.ChannelID, embed)
+				return
+			}
+
+			// 1. Resolve the name/index
+			input := strings.Join(args[2:], " ")
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, input)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+				return
+			}
+
+			// 2. Fetch the contents
+			sentences, err := db.OpenVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to open vault: "+err.Error())
+				return
+			}
+
+			// 3. Build the Embed
+			embed := &discordgo.MessageEmbed{
+				Title: "📖 Vault Contents: 『 " + vaultName + " 』",
+				Color: 0xC6D8F0,
+			}
+
+			if len(sentences) == 0 {
+				embed.Description = "*This vault is currently empty.*"
+			} else {
+				// Format sentences nicely inside the embed
+				var formatted []string
+				for i, sent := range sentences {
+					formatted = append(formatted, fmt.Sprintf("**%d.** %s", i+1, sent))
+				}
+				embed.Description = strings.Join(formatted, "\n\n")
+			}
+			s.ChannelMessageSendEmbed(m.ChannelID, embed)
 
 		case "delete":
 			if len(args) == 2 {
-				s.ChannelMessageSend(m.ChannelID, "⚠️ Please specify which vault to incinerate: `!vault delete <name>`")
+				listData, err := db.ListVaults(m.Author.ID)
+				if err != nil {
+					s.ChannelMessageSend(m.ChannelID, "⚠️ Error reading the void: "+err.Error())
+					return
+				}
+
+				userState.Store(m.Author.ID, "awaiting_vault_delete_name")
+
+				embed := &discordgo.MessageEmbed{
+					Title:       "🔥 Select a Grimoire to Incinerate",
+					Color:       0xC6D8F0,
+					Description: listData + "\n\n*Reply with the name or index number (or type `cancel`).*",
+				}
+				s.ChannelMessageSendEmbed(m.ChannelID, embed)
 				return
 			}
-			vaultName := strings.Join(args[2:], " ")
-			s.ChannelMessageSend(m.ChannelID, "🔥 Incinerating vault: "+vaultName+"... (Feature pending)")
+
+			// 1. Resolve the name/index
+			input := strings.Join(args[2:], " ")
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, input)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+				return
+			}
+
+			if vaultName == "Primary Grimoire" {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ The Primary Grimoire cannot be destroyed.")
+				return
+			}
+
+			response, err := db.DeleteVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to incinerate vault: "+err.Error())
+				return
+			}
+			s.ChannelMessageSend(m.ChannelID, response)
 
 		default:
 			s.ChannelMessageSend(m.ChannelID, "⚠️ Unknown vault command. Type `!vault` for the manual.")
