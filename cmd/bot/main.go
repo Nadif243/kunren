@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,9 @@ import (
 )
 
 var userState sync.Map
+
+// mineCache temporarily holds the latest mined sentences for each user.
+var mineCache sync.Map // Maps m.Author.ID -> []db.ExtractedSentence
 
 func main() {
 	// 1. Load the secret token from the .env file
@@ -136,7 +140,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		results := worker.RunPool(urls, 5)
 
 		// 3. The Goldilocks Filter
-		var validSentences []string
+		var validSentences []db.ExtractedSentence
 		for _, res := range results {
 			if res.Err != nil {
 				continue // Silently ignore dead websites
@@ -148,7 +152,12 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 					// Must be longer than 15 chars (destroys headers/dates)
 					// Must be shorter than 60 chars (destroys run-on paragraphs)
 					if runeCount >= 15 && runeCount <= 60 {
-						validSentences = append(validSentences, sentence)
+						// Capture the text AND the URL
+						validSentences = append(validSentences, db.ExtractedSentence{
+							Keyword: keyword,
+							RawText: sentence,
+							Source:  res.URL, // Ensure 'URL' matches the field name in your worker result struct
+						})
 					}
 				}
 			}
@@ -180,17 +189,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			Fields: []*discordgo.MessageEmbedField{},
 		}
 
+		// Prepare a slice to hold exactly what we show the user, so indices match perfectly
+		var cachePayload []db.ExtractedSentence
+
 		for i := 0; i < limit; i++ {
+			extracted := validSentences[i]
+			cachePayload = append(cachePayload, extracted)
+
 			// Replace the target word with an inline code block so it has a distinct background
-			highlighted := strings.ReplaceAll(validSentences[i], keyword, fmt.Sprintf("`%s`", keyword))
+			highlighted := strings.ReplaceAll(extracted.RawText, keyword, fmt.Sprintf("`%s`", keyword))
+
+			// Optional: We can now hyper-link the source directly in the embed using Discord's markdown
+			valueText := fmt.Sprintf("%s\n*[Source Link](%s)*", highlighted, extracted.Source)
 
 			// Append each sentence as its own distinct block in the UI
 			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
 				Name:   fmt.Sprintf("Result %d", i+1),
-				Value:  highlighted,
+				Value:  valueText,
 				Inline: false,
 			})
 		}
+
+		// Seed the Transmutation Cache
+		// We store ONLY the exact 3 (or fewer) sentences we displayed to the user.
+		// If they type !save 1, it will perfectly match cachePayload[0].
+		mineCache.Store(m.Author.ID, cachePayload)
 
 		// Using SendEmbed instead of Send
 		s.ChannelMessageSendEmbed(m.ChannelID, embed)
@@ -288,6 +311,47 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to incinerate vault: "+err.Error())
 			} else {
 				s.ChannelMessageSend(m.ChannelID, response)
+			}
+
+			userState.Delete(m.Author.ID)
+			return
+		}
+
+		// State: Saving fragments (Missing Vault Target)
+		if strings.HasPrefix(stateStr, "awaiting_save_vault|") {
+			// Extract the indices they wanted to save
+			indicesStr := strings.TrimPrefix(stateStr, "awaiting_save_vault|")
+			indices := strings.Split(indicesStr, ",")
+
+			// Resolve the vault they just typed in chat
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, input)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			// Pull from cache
+			cachedData, ok := mineCache.Load(m.Author.ID)
+			if !ok {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Cache expired. Mine again.")
+				userState.Delete(m.Author.ID)
+				return
+			}
+			extractedList := cachedData.([]db.ExtractedSentence)
+
+			var selectedSentences []db.ExtractedSentence
+			for _, idxStr := range indices {
+				idx, _ := strconv.Atoi(idxStr) // Already validated in the initial command
+				selectedSentences = append(selectedSentences, extractedList[idx-1])
+			}
+
+			// Execute Save
+			count, err := db.SaveToVault(m.Author.ID, vaultName, selectedSentences)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to bind fragments: "+err.Error())
+			} else {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🩸 Successfully bound **%d** fragment(s) to 『 %s 』.", count, vaultName))
 			}
 
 			userState.Delete(m.Author.ID)
@@ -451,6 +515,76 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		default:
 			s.ChannelMessageSend(m.ChannelID, "⚠️ Unknown vault command. Type `!vault` for the manual.")
 		}
+		return
+	}
+
+	// --- 3. THE SAVE ROUTER ---
+	if strings.HasPrefix(m.Content, "!save") {
+		// 1. Verify they actually mined something recently
+		cachedData, ok := mineCache.Load(m.Author.ID)
+		if !ok {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ You have no active transmutations in the cache. Run `!mine <word>` first.")
+			return
+		}
+		extractedList := cachedData.([]db.ExtractedSentence)
+
+		// 2. Parse the syntax
+		content := strings.TrimSpace(strings.TrimPrefix(m.Content, "!save"))
+		if content == "" {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Specify which fragments to bind (e.g., `!save 1 2` or `!save 1 to 1`).")
+			return
+		}
+
+		parts := strings.SplitN(content, " to ", 2)
+		indicesStr := strings.Fields(parts[0]) // e.g., ["1", "3"]
+
+		// Validate indices
+		var selectedSentences []db.ExtractedSentence
+		for _, idxStr := range indicesStr {
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil || idx < 1 || idx > len(extractedList) {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("⚠️ Fragment `%s` does not exist in the current cache.", idxStr))
+				return
+			}
+			selectedSentences = append(selectedSentences, extractedList[idx-1])
+		}
+
+		// 3. If they omitted the "to <vault>" target
+		if len(parts) == 1 {
+			listData, err := db.ListVaults(m.Author.ID)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Error reading the void: "+err.Error())
+				return
+			}
+
+			// We pass the indices safely via the state string (e.g., "awaiting_save_vault|1,3")
+			statePayload := "awaiting_save_vault|" + strings.Join(indicesStr, ",")
+			userState.Store(m.Author.ID, statePayload)
+
+			embed := &discordgo.MessageEmbed{
+				Title:       "📖 Select a Destination Grimoire",
+				Color:       0xC6D8F0,
+				Description: listData + "\n\n*Reply with the name or index number (or type `cancel`).*",
+			}
+			s.ChannelMessageSendEmbed(m.ChannelID, embed)
+			return
+		}
+
+		// 4. If they provided the full command (e.g., !save 1 3 to 1)
+		vaultInput := strings.TrimSpace(parts[1])
+		vaultName, err := db.ResolveVaultInput(m.Author.ID, vaultInput)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+			return
+		}
+
+		count, err := db.SaveToVault(m.Author.ID, vaultName, selectedSentences)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to bind fragments: "+err.Error())
+			return
+		}
+
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🩸 Successfully bound **%d** fragment(s) to 『 %s 』.", count, vaultName))
 		return
 	}
 }

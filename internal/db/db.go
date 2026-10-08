@@ -213,3 +213,47 @@ func ResolveVaultInput(discordID, input string) (string, error) {
 
 	return input, nil
 }
+
+// ExtractedSentence represents a raw fragment pulled from the void.
+type ExtractedSentence struct {
+	Keyword string
+	RawText string
+	Source  string
+}
+
+// SaveToVault bulk-inserts cached sentences into a specified grimoire.
+func SaveToVault(discordID, vaultName string, sentences []ExtractedSentence) (int, error) {
+	// 1. Get the target vault ID
+	var vaultID int
+	err := DB.QueryRow("SELECT id FROM vaults WHERE owner_id = ? AND name = ?", discordID, vaultName).Scan(&vaultID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to locate vault: %w", err)
+	}
+
+	// 2. Begin transaction for bulk insert
+	tx, err := DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO sentences (vault_id, keyword, raw_text, source_url) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	for _, s := range sentences {
+		_, err = stmt.Exec(vaultID, s.Keyword, s.RawText, s.Source)
+		if err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return 0, err
+	}
+
+	return len(sentences), nil
+}
