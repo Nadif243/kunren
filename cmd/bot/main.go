@@ -10,7 +10,8 @@ import (
 	"strings"
 	"syscall"
 
-	"kunnrenengine/internal/worker"
+	"rennbunengine/internal/db"
+	"rennbunengine/internal/worker"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -23,35 +24,53 @@ func main() {
 		log.Println("Warning: No .env file found.")
 	}
 
+	// 2. Ignite the Crucible
+	db.InitDB("./renbun.db")
+	defer db.DB.Close()
+
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
 		log.Fatal("CRITICAL: DISCORD_TOKEN is missing!")
 	}
 
-	// 2. Initialize the Discord Session
+	// 3. Initialize the Discord Session
 	// The Discord API requires the exact prefix "Bot " before the token.
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
 		log.Fatal("Error creating Discord session: ", err)
 	}
 
-	// 3. Register the Event Handler
+	// 4. Register the Event Handler
 	// This tells the Go runtime: "Every time a message is sent in the Discord server,
 	// execute the 'messageCreate' function."
 	dg.AddHandler(messageCreate)
 
-	// 4. Declare Gateway Intents
+	// 5. Declare Gateway Intents
 	// This matches the "Message Content Intent" toggled in the Developer Portal.
 	// Without this, Discord will censor the text of the messages sent to the bot.
 	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentMessageContent
 
-	// 5. Open the WebSocket connection
+	// 6. Open the WebSocket connection
 	err = dg.Open()
 	if err != nil {
 		log.Fatal("Error opening connection: ", err)
 	}
 
-	// 6. Keep the Server Alive
+	// Set the Alchemy Custom Status
+	err = dg.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Activities: []*discordgo.Activity{
+			{
+				Type:  discordgo.ActivityTypeCustom,
+				Name:  "Custom Status",        // Discord API requires this field to be populated
+				State: "錬金術駆動の没入型エンジンで言葉を錬成中", //Refining text through an alchemy-driven immersion engine
+			},
+		},
+	})
+	if err != nil {
+		fmt.Println("Warning: Could not set custom status:", err)
+	}
+
+	// 7. Keep the Server Alive
 	fmt.Println("Renbun Engine (錬文) is online. Press CTRL-C to exit.")
 
 	// Create a channel to listen for OS-level interrupt signals (like Ctrl+C).
@@ -60,7 +79,7 @@ func main() {
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 
-	// 7. Clean Shutdown
+	// 8. Clean Shutdown
 	fmt.Println("\nShutting down Renbun Engine safely...")
 	dg.Close()
 }
@@ -172,5 +191,33 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		// Using SendEmbed instead of Send
 		s.ChannelMessageSendEmbed(m.ChannelID, embed)
+	}
+
+	// The Binding Command
+	if m.Content == "!bind" {
+		response, err := db.BindUser(m.Author.ID)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Alchemical failure during binding: "+err.Error())
+			return
+		}
+		s.ChannelMessageSend(m.ChannelID, "🩸 "+response)
+		return
+	}
+
+	// The Vault Creation Command (!vault create <name>)
+	if strings.HasPrefix(m.Content, "!vault create ") {
+		vaultName := strings.TrimSpace(strings.TrimPrefix(m.Content, "!vault create "))
+		if vaultName == "" {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ You must provide a name for the vault. (e.g., `!vault create Technical Vault`)")
+			return
+		}
+
+		response, err := db.CreateVault(m.Author.ID, vaultName)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to structure the vault: "+err.Error())
+			return
+		}
+		s.ChannelMessageSend(m.ChannelID, "📖 "+response)
+		return
 	}
 }
