@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"rennbunengine/internal/db"
@@ -16,6 +17,8 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
 )
+
+var userState sync.Map
 
 func main() {
 	// 1. Load the secret token from the .env file
@@ -204,20 +207,103 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// The Vault Creation Command (!vault create <name>)
-	if strings.HasPrefix(m.Content, "!vault create ") {
-		vaultName := strings.TrimSpace(strings.TrimPrefix(m.Content, "!vault create "))
-		if vaultName == "" {
-			s.ChannelMessageSend(m.ChannelID, "⚠️ You must provide a name for the vault. (e.g., `!vault create Technical Vault`)")
+	// --- STATE INTERCEPTOR ---
+	// If the user is in the middle of a process, intercept their message before checking commands.
+	if state, ok := userState.Load(m.Author.ID); ok {
+		if state == "awaiting_vault_create_name" {
+			vaultName := strings.TrimSpace(m.Content)
+
+			// Optional: Allow them to cancel
+			if vaultName == "cancel" {
+				userState.Delete(m.Author.ID)
+				s.ChannelMessageSend(m.ChannelID, "Vault creation aborted.")
+				return
+			}
+
+			// Execute creation
+			response, err := db.CreateVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to structure the vault: "+err.Error())
+			} else {
+				s.ChannelMessageSend(m.ChannelID, "📖 "+response)
+			}
+
+			// Clear the state so they can use normal commands again
+			userState.Delete(m.Author.ID)
+			return
+		}
+		// You can add more states here later (e.g., awaiting_vault_delete_name)
+	}
+
+	// --- THE VAULT ROUTER ---
+	if strings.HasPrefix(m.Content, "!vault") {
+		// Verify binding status FIRST to protect all subcommands
+		var isBound bool
+		err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE discord_id = ?)", m.Author.ID).Scan(&isBound)
+		if err != nil || !isBound {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ You are not bound to the crucible. Run `!bind` first.")
 			return
 		}
 
-		response, err := db.CreateVault(m.Author.ID, vaultName)
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to structure the vault: "+err.Error())
+		// Split the command into arguments (e.g., "!vault", "create", "Slang")
+		args := strings.Fields(m.Content)
+
+		// If they just typed exactly "!vault"
+		if len(args) == 1 {
+			helpText := "**📖 The Vault Grimoire**\n" +
+				"`!vault create <name>` - Forge a new collection\n" +
+				"`!vault list` - View your active vaults\n" +
+				"`!vault open <name>` - Inspect a vault's contents\n" +
+				"`!vault delete <name>` - Incinerate a collection"
+			s.ChannelMessageSend(m.ChannelID, helpText)
 			return
 		}
-		s.ChannelMessageSend(m.ChannelID, "📖 "+response)
+
+		// Subcommand branching
+		subCommand := args[1]
+
+		switch subCommand {
+		case "create":
+			// If they typed "!vault create" with no name
+			if len(args) == 2 {
+				// Put them in the state map to wait for their next message
+				userState.Store(m.Author.ID, "awaiting_vault_create_name")
+				s.ChannelMessageSend(m.ChannelID, "Enter the name for your new vault (or type `cancel`):")
+				return
+			}
+			// If they typed "!vault create MyVault"
+			vaultName := strings.Join(args[2:], " ") // Joins multi-word names
+			response, err := db.CreateVault(m.Author.ID, vaultName)
+			if err != nil {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Error: "+err.Error())
+				return
+			}
+			s.ChannelMessageSend(m.ChannelID, "📖 "+response)
+
+		case "list":
+			// We will build db.ListVaults() next
+			s.ChannelMessageSend(m.ChannelID, "🔍 Listing vaults... (Feature pending)")
+
+		case "open":
+			// Same logic: Check if name was provided, if not, set a state or show error
+			if len(args) == 2 {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Please specify which vault to open: `!vault open <name>`")
+				return
+			}
+			vaultName := strings.Join(args[2:], " ")
+			s.ChannelMessageSend(m.ChannelID, "📖 Opening vault: "+vaultName+"... (Feature pending)")
+
+		case "delete":
+			if len(args) == 2 {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Please specify which vault to incinerate: `!vault delete <name>`")
+				return
+			}
+			vaultName := strings.Join(args[2:], " ")
+			s.ChannelMessageSend(m.ChannelID, "🔥 Incinerating vault: "+vaultName+"... (Feature pending)")
+
+		default:
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Unknown vault command. Type `!vault` for the manual.")
+		}
 		return
 	}
 }
