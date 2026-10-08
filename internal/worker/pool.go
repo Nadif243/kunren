@@ -2,7 +2,7 @@ package worker
 
 import (
 	"fmt"
-	"kunnrenengine/internal/scraper"
+	"rennbunengine/internal/scraper"
 	"sync"
 )
 
