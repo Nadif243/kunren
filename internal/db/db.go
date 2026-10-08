@@ -53,6 +53,11 @@ func InitDB(filepath string) {
 	if err != nil {
 		log.Fatal("Critical: Failed to engrave the schema:", err)
 	}
+
+	_, err = DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_text ON sentences(vault_id, raw_text);")
+	if err != nil {
+		log.Fatal("Critical: Failed to engrave the unique index:", err)
+	}
 }
 
 // BindUser ties a Discord soul to the engine and creates their first grimoire.
@@ -236,18 +241,21 @@ func SaveToVault(discordID, vaultName string, sentences []ExtractedSentence) (in
 		return 0, err
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO sentences (vault_id, keyword, raw_text, source_url) VALUES (?, ?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO sentences (vault_id, keyword, raw_text, source_url) VALUES (?, ?, ?, ?)")
 	if err != nil {
 		return 0, err
 	}
 	defer stmt.Close()
 
+	var addedCount int64
 	for _, s := range sentences {
-		_, err = stmt.Exec(vaultID, s.Keyword, s.RawText, s.Source)
+		res, err := stmt.Exec(vaultID, s.Keyword, s.RawText, s.Source)
 		if err != nil {
 			tx.Rollback()
 			return 0, err
 		}
+		aff, _ := res.RowsAffected()
+		addedCount += aff
 	}
 
 	err = tx.Commit()
@@ -255,5 +263,5 @@ func SaveToVault(discordID, vaultName string, sentences []ExtractedSentence) (in
 		return 0, err
 	}
 
-	return len(sentences), nil
+	return int(addedCount), nil
 }

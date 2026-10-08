@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"rennbunengine/internal/db"
 	"rennbunengine/internal/worker"
@@ -18,6 +19,11 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
 )
+
+type CacheEntry struct {
+	Payload   []db.ExtractedSentence
+	ExpiresAt time.Time
+}
 
 var userState sync.Map
 
@@ -213,7 +219,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		// Seed the Transmutation Cache
 		// We store ONLY the exact 3 (or fewer) sentences we displayed to the user.
 		// If they type !save 1, it will perfectly match cachePayload[0].
-		mineCache.Store(m.Author.ID, cachePayload)
+		mineCache.Store(m.Author.ID, CacheEntry{
+			Payload:   cachePayload,
+			ExpiresAt: time.Now().Add(15 * time.Minute), // Cache rots after 15 minutes
+		})
 
 		// Using SendEmbed instead of Send
 		s.ChannelMessageSendEmbed(m.ChannelID, embed)
@@ -338,7 +347,16 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				userState.Delete(m.Author.ID)
 				return
 			}
-			extractedList := cachedData.([]db.ExtractedSentence)
+
+			entry := cachedData.(CacheEntry)
+			if time.Now().After(entry.ExpiresAt) {
+				mineCache.Delete(m.Author.ID)
+				s.ChannelMessageSend(m.ChannelID, "⚠️ Your mined fragments have decayed. Please run `!mine` again.")
+				userState.Delete(m.Author.ID)
+				return
+			}
+
+			extractedList := entry.Payload
 
 			var selectedSentences []db.ExtractedSentence
 			for _, idxStr := range indices {
@@ -350,8 +368,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			count, err := db.SaveToVault(m.Author.ID, vaultName, selectedSentences)
 			if err != nil {
 				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to bind fragments: "+err.Error())
+			} else if count == 0 {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🛡️ 『 %s 』: All selected fragments already exist here.", vaultName))
 			} else {
-				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🩸 Successfully bound **%d** fragment(s) to 『 %s 』.", count, vaultName))
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🩸 Successfully bound **%d** new fragment(s) to 『 %s 』.", count, vaultName))
 			}
 
 			userState.Delete(m.Author.ID)
@@ -526,7 +546,15 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			s.ChannelMessageSend(m.ChannelID, "⚠️ You have no active transmutations in the cache. Run `!mine <word>` first.")
 			return
 		}
-		extractedList := cachedData.([]db.ExtractedSentence)
+
+		entry := cachedData.(CacheEntry)
+		if time.Now().After(entry.ExpiresAt) {
+			mineCache.Delete(m.Author.ID) // Purge the rotted cache
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Your mined fragments have decayed. Please run `!mine` again.")
+			return
+		}
+
+		extractedList := entry.Payload
 
 		// 2. Parse the syntax
 		content := strings.TrimSpace(strings.TrimPrefix(m.Content, "!save"))
@@ -570,21 +598,33 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			return
 		}
 
-		// 4. If they provided the full command (e.g., !save 1 3 to 1)
-		vaultInput := strings.TrimSpace(parts[1])
-		vaultName, err := db.ResolveVaultInput(m.Author.ID, vaultInput)
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
-			return
+		// 4. If they provided the full command (e.g., !save 1 2 to 1, Slang)
+		vaultTargets := strings.Split(parts[1], ",")
+		var successLogs []string
+
+		for _, rawTarget := range vaultTargets {
+			target := strings.TrimSpace(rawTarget)
+			if target == "" {
+				continue
+			}
+
+			vaultName, err := db.ResolveVaultInput(m.Author.ID, target)
+			if err != nil {
+				successLogs = append(successLogs, fmt.Sprintf("⚠️ `%s`: %s", target, err.Error()))
+				continue
+			}
+
+			count, err := db.SaveToVault(m.Author.ID, vaultName, selectedSentences)
+			if err != nil {
+				successLogs = append(successLogs, fmt.Sprintf("⚠️ `%s`: Failed to bind - %s", vaultName, err.Error()))
+			} else if count == 0 {
+				successLogs = append(successLogs, fmt.Sprintf("🛡️ 『 %s 』: All selected fragments already exist here.", vaultName))
+			} else {
+				successLogs = append(successLogs, fmt.Sprintf("🩸 『 %s 』: Bound **%d** new fragment(s).", vaultName, count))
+			}
 		}
 
-		count, err := db.SaveToVault(m.Author.ID, vaultName, selectedSentences)
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to bind fragments: "+err.Error())
-			return
-		}
-
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🩸 Successfully bound **%d** fragment(s) to 『 %s 』.", count, vaultName))
+		s.ChannelMessageSend(m.ChannelID, strings.Join(successLogs, "\n"))
 		return
 	}
 }
