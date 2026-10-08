@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"rennbunengine/internal/db"
+	"rennbunengine/internal/oracle"
 	"rennbunengine/internal/worker"
 
 	"github.com/bwmarrin/discordgo"
@@ -30,6 +32,9 @@ var userState sync.Map
 // mineCache temporarily holds the latest mined sentences for each user.
 var mineCache sync.Map // Maps m.Author.ID -> []db.ExtractedSentence
 
+// vaultCache remembers the last 10 sentences a user viewed via '!vault open'
+var vaultCache sync.Map // Maps m.Author.ID -> []string (raw japanese text)
+
 func main() {
 	// 1. Load the secret token from the .env file
 	err := godotenv.Load(".env")
@@ -44,6 +49,15 @@ func main() {
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
 		log.Fatal("CRITICAL: DISCORD_TOKEN is missing!")
+	}
+
+	// Ignite the Oracle
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey == "" {
+		log.Fatal("Critical: GEMINI_API_KEY is missing from the void (.env)")
+	}
+	if err := oracle.InitOracle(geminiKey); err != nil {
+		log.Fatal(err)
 	}
 
 	// 3. Initialize the Discord Session
@@ -474,6 +488,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				s.ChannelMessageSend(m.ChannelID, "⚠️ Failed to open vault: "+err.Error())
 				return
 			}
+			// SEED THE VAULT CACHE
+			vaultCache.Store(m.Author.ID, sentences)
 
 			// 3. Build the Embed
 			embed := &discordgo.MessageEmbed{
@@ -625,6 +641,121 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 
 		s.ChannelMessageSend(m.ChannelID, strings.Join(successLogs, "\n"))
+		return
+	}
+
+	// --- 4. THE ORACLE ROUTER ---
+
+	// Helper function to resolve the target text (Index vs Raw Text)
+	resolveTargetText := func(input string) (string, error) {
+		input = strings.TrimSpace(input)
+		if input == "" {
+			return "", fmt.Errorf("provide a vault index (e.g., `1`) or raw Japanese text.")
+		}
+		// If they typed a number, pull from vaultCache
+		if idx, err := strconv.Atoi(input); err == nil {
+			cachedData, ok := vaultCache.Load(m.Author.ID)
+			if !ok {
+				return "", fmt.Errorf("no open grimoire found. Run `!vault open <name>` first.")
+			}
+			sentences := cachedData.([]string)
+			if idx < 1 || idx > len(sentences) {
+				return "", fmt.Errorf("index %d does not exist in your open grimoire.", idx)
+			}
+			return sentences[idx-1], nil
+		}
+		// If it's not a number, assume they typed raw Japanese text
+		return input, nil
+	}
+
+	// !present Command
+	if strings.HasPrefix(m.Content, "!present") {
+		targetText, err := resolveTargetText(strings.TrimPrefix(m.Content, "!present"))
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+			return
+		}
+
+		// Send a loading state (Gemini takes 2-3 seconds)
+		loadingMsg, _ := s.ChannelMessageSend(m.ChannelID, "⏳ *The Oracle is peering into the syntax...*")
+
+		ctx := context.Background()
+		res, err := oracle.Present(ctx, targetText)
+
+		// Delete loading message
+		s.ChannelMessageDelete(m.ChannelID, loadingMsg.ID)
+
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Oracle failure: "+err.Error())
+			return
+		}
+
+		embed := &discordgo.MessageEmbed{
+			Color:       0xC6D8F0, // Powder Blue
+			Description: fmt.Sprintf("**『 %s 』**\n\n**Kana:** %s\n**Meaning:** %s", targetText, res.Reading, res.Translation),
+		}
+		s.ChannelMessageSendEmbed(m.ChannelID, embed)
+		return
+	}
+
+	// !dissect Command
+	if strings.HasPrefix(m.Content, "!dissect") {
+		targetText, err := resolveTargetText(strings.TrimPrefix(m.Content, "!dissect"))
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "⚠️ "+err.Error())
+			return
+		}
+
+		loadingMsg, _ := s.ChannelMessageSend(m.ChannelID, "👁️ *The Oracle is dissecting the linguistics...*")
+
+		ctx := context.Background()
+		res, err := oracle.Dissect(ctx, targetText)
+
+		s.ChannelMessageDelete(m.ChannelID, loadingMsg.ID)
+
+		if err != nil {
+			// Catch rate limits gracefully
+			if strings.Contains(err.Error(), "429") {
+				s.ChannelMessageSend(m.ChannelID, "⚠️ The Oracle is overwhelmed by requests. Please wait a minute and try again.")
+				return
+			}
+			s.ChannelMessageSend(m.ChannelID, "⚠️ Oracle failure: "+err.Error())
+			return
+		}
+
+		embed := &discordgo.MessageEmbed{
+			Title:       "👁️ Alchemical Dissection",
+			Color:       0xC6D8F0, // Powder Blue
+			Description: fmt.Sprintf("**Target:** %s\n**Kana:** %s\n**Translation:** %s", targetText, res.Reading, res.Translation),
+			Fields: []*discordgo.MessageEmbedField{
+				{Name: "JLPT Level", Value: res.JLPT, Inline: true},
+				{Name: "Nuance & Context", Value: res.Nuance, Inline: false},
+			},
+		}
+
+		// Format Grammar
+		if len(res.Grammar) > 0 {
+			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+				Name:   "Grammar Architecture",
+				Value:  "- " + strings.Join(res.Grammar, "\n- "),
+				Inline: false,
+			})
+		}
+
+		// Format Vocab
+		if len(res.Vocab) > 0 {
+			var vocabLines []string
+			for _, v := range res.Vocab {
+				vocabLines = append(vocabLines, fmt.Sprintf("• **%s** (%s): %s", v.Word, v.Reading, v.Meaning))
+			}
+			embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+				Name:   "Morphological Breakdown",
+				Value:  strings.Join(vocabLines, "\n"),
+				Inline: false,
+			})
+		}
+
+		s.ChannelMessageSendEmbed(m.ChannelID, embed)
 		return
 	}
 }
